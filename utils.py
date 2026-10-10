@@ -1,37 +1,50 @@
 import os
 import json
 import logging
+import shutil
+from guides_data import GUIDES
 
 logger = logging.getLogger(__name__)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, 'data')
+DATA_DIR = os.getenv('DATA_DIR', os.path.join(BASE_DIR, 'data'))
+
+def seed_data_dir():
+    """Seed /app/data if Bothost mounted an empty volume over it"""
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        static_dir = os.path.join(BASE_DIR, 'static_data')
+        if os.path.exists(static_dir):
+            for fname in os.listdir(static_dir):
+                src = os.path.join(static_dir, fname)
+                dst = os.path.join(DATA_DIR, fname)
+                if not os.path.exists(dst) and os.path.isfile(src):
+                    shutil.copy(src, dst)
+        
+        # Seed marielaveau.db if not yet in DATA_DIR
+        db_src = os.path.join(BASE_DIR, 'database', 'marielaveau.db')
+        db_dst = os.path.join(DATA_DIR, 'marielaveau.db')
+        if not os.path.exists(db_dst) and os.path.exists(db_src):
+            shutil.copy(db_src, db_dst)
+    except Exception as e:
+        logger.error(f"Error seeding data dir: {e}")
+
+# Seed on startup
+seed_data_dir()
 
 def load_guides() -> list:
-    candidates = [
-        os.path.join(DATA_DIR, 'guides.json'),
-        os.path.join(BASE_DIR, 'data', 'guides.json'),
-        os.path.abspath(os.path.join(os.getcwd(), 'data', 'guides.json')),
-        os.path.abspath('data/guides.json'),
-    ]
-    for path in candidates:
-        if os.path.exists(path):
-            try:
-                with open(path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    if isinstance(data, list) and len(data) > 0:
-                        return data
-            except Exception as e:
-                logger.error(f"Error reading {path}: {e}")
+    guides_path = os.path.join(DATA_DIR, 'guides.json')
+    if os.path.exists(guides_path):
+        try:
+            with open(guides_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if isinstance(data, list) and len(data) > 0:
+                    return data
+        except Exception as e:
+            logger.error(f"Error reading {guides_path}: {e}")
 
-    try:
-        from data.guides_defaults import GUIDES
-        if GUIDES:
-            return GUIDES
-    except Exception as e:
-        logger.error(f"Error loading fallback guides: {e}")
-
-    return []
+    # Root guides_data is always available even if volume masked data/
+    return GUIDES
 
 def format_card_question(item: dict, is_exam: bool = False, current_q: int = 1, total_q: int = 15) -> str:
     category = item.get('category')

@@ -5,8 +5,19 @@ import random
 from datetime import datetime
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, 'marielaveau.db')
-DATA_DIR = os.path.abspath(os.path.join(BASE_DIR, '..', 'data'))
+DATA_DIR = os.getenv('DATA_DIR', os.path.abspath(os.path.join(BASE_DIR, '..', 'data')))
+DB_IN_DATA = os.path.join(DATA_DIR, 'marielaveau.db')
+DB_IN_BASE = os.path.join(BASE_DIR, 'marielaveau.db')
+
+if not os.path.exists(DB_IN_DATA) and os.path.exists(DB_IN_BASE):
+    try:
+        import shutil
+        os.makedirs(DATA_DIR, exist_ok=True)
+        shutil.copy(DB_IN_BASE, DB_IN_DATA)
+    except Exception:
+        pass
+
+DB_PATH = DB_IN_DATA if os.path.exists(DB_IN_DATA) else DB_IN_BASE
 
 def get_connection():
     return aiosqlite.connect(DB_PATH)
