@@ -4,8 +4,9 @@ import os
 import random
 from datetime import datetime
 
-DB_PATH = os.path.join(os.path.dirname(__file__), 'marielaveau.db')
-DATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'data')
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, 'marielaveau.db')
+DATA_DIR = os.path.abspath(os.path.join(BASE_DIR, '..', 'data'))
 
 def get_connection():
     return aiosqlite.connect(DB_PATH)

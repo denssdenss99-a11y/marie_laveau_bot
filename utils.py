@@ -1,13 +1,36 @@
-import json
 import os
+import json
+import logging
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
+logger = logging.getLogger(__name__)
 
-def load_guides():
-    guides_path = os.path.join(DATA_DIR, 'guides.json')
-    if os.path.exists(guides_path):
-        with open(guides_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, 'data')
+
+def load_guides() -> list:
+    candidates = [
+        os.path.join(DATA_DIR, 'guides.json'),
+        os.path.join(BASE_DIR, 'data', 'guides.json'),
+        os.path.abspath(os.path.join(os.getcwd(), 'data', 'guides.json')),
+        os.path.abspath('data/guides.json'),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if isinstance(data, list) and len(data) > 0:
+                        return data
+            except Exception as e:
+                logger.error(f"Error reading {path}: {e}")
+
+    try:
+        from data.guides_defaults import GUIDES
+        if GUIDES:
+            return GUIDES
+    except Exception as e:
+        logger.error(f"Error loading fallback guides: {e}")
+
     return []
 
 def format_card_question(item: dict, is_exam: bool = False, current_q: int = 1, total_q: int = 15) -> str:
