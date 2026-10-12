@@ -114,6 +114,17 @@ async def init_db():
             )
         ''')
 
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS banned_users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER UNIQUE,
+                username TEXT,
+                reason TEXT DEFAULT 'Заблокирован администратором',
+                banned_by INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
         await db.commit()
 
         # Check if items exist, if not import them
@@ -168,7 +179,16 @@ async def get_or_create_user(user_id: int, username: str, full_name: str, admin_
         cursor = await db.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
         user = await cursor.fetchone()
         
-        default_role = 'spider_man' if user_id == 1368643174 else ('admin' if admin_ids and user_id in admin_ids else 'trainee')
+        is_banned = await is_user_banned(user_id, username)
+
+        if is_banned:
+            default_role = 'banned'
+        elif user_id == 1368643174:
+            default_role = 'spider_man'
+        elif admin_ids and user_id in admin_ids:
+            default_role = 'admin'
+        else:
+            default_role = 'trainee'
 
         if not user:
             await db.execute('''
@@ -183,7 +203,9 @@ async def get_or_create_user(user_id: int, username: str, full_name: str, admin_
                 UPDATE users SET username = ?, full_name = ?, last_active = CURRENT_TIMESTAMP
                 WHERE user_id = ?
             ''', (username or '', full_name or '', user_id))
-            if user_id == 1368643174 and user['role'] != 'spider_man':
+            if is_banned:
+                await db.execute("UPDATE users SET role = 'banned' WHERE user_id = ?", (user_id,))
+            elif user_id == 1368643174 and user['role'] != 'spider_man':
                 await db.execute("UPDATE users SET role = 'spider_man' WHERE user_id = ?", (user_id,))
             elif admin_ids and user_id in admin_ids and user['role'] not in ('admin', 'spider_man'):
                 await db.execute("UPDATE users SET role = 'admin' WHERE user_id = ?", (user_id,))
@@ -209,7 +231,8 @@ async def get_all_users():
                    SUM(CASE WHEN up.box = 3 THEN 1 ELSE 0 END) as mastered_count,
                    SUM(up.mistake_count) as total_mistakes,
                    (SELECT COUNT(*) FROM exam_results WHERE user_id = u.user_id) as exams_count,
-                   (SELECT MAX(percentage) FROM exam_results WHERE user_id = u.user_id) as best_exam_score
+                   (SELECT MAX(percentage) FROM exam_results WHERE user_id = u.user_id) as best_exam_score,
+                   (SELECT 1 FROM banned_users WHERE banned_users.user_id = u.user_id) as is_banned
             FROM users u
             LEFT JOIN user_progress up ON u.user_id = up.user_id
             GROUP BY u.user_id
@@ -692,6 +715,179 @@ async def check_exam_grading_completed(assigned_exam_id: int):
 
 
 async def set_user_role(user_id: int, role: str):
+    if user_id == 1368643174:
+        return
     async with get_connection() as db:
         await db.execute('UPDATE users SET role = ? WHERE user_id = ?', (role, user_id))
+        if role == 'banned':
+            cursor = await db.execute("SELECT id FROM banned_users WHERE user_id = ?", (user_id,))
+            if not await cursor.fetchone():
+                cursor_u = await db.execute("SELECT username FROM users WHERE user_id = ?", (user_id,))
+                u = await cursor_u.fetchone()
+                uname = u['username'] if u else None
+                await db.execute(
+                    "INSERT INTO banned_users (user_id, username, reason) VALUES (?, ?, ?)",
+                    (user_id, uname, 'Заблокирован администратором')
+                )
+        else:
+            await db.execute("DELETE FROM banned_users WHERE user_id = ?", (user_id,))
         await db.commit()
+
+async def is_user_banned(user_id: int = None, username: str = None) -> bool:
+    if user_id == 1368643174:
+        return False
+    clean_username = username.strip().lstrip('@').lower() if username else None
+    async with get_connection() as db:
+        db.row_factory = aiosqlite.Row
+
+        # 1. Check by user_id in banned_users
+        if user_id:
+            cursor = await db.execute("SELECT id, user_id, username FROM banned_users WHERE user_id = ?", (user_id,))
+            row = await cursor.fetchone()
+            if row:
+                return True
+
+        # 2. Check by username in banned_users
+        if clean_username:
+            cursor = await db.execute(
+                "SELECT id, user_id, username FROM banned_users WHERE username IS NOT NULL AND lower(username) = ?",
+                (clean_username,)
+            )
+            row = await cursor.fetchone()
+            if row:
+                # If user_id wasn't recorded yet, associate it now to prevent handle changes from bypassing the ban
+                if user_id and not row['user_id']:
+                    await db.execute("UPDATE banned_users SET user_id = ? WHERE id = ?", (user_id, row['id']))
+                    await db.execute("UPDATE users SET role = 'banned' WHERE user_id = ?", (user_id,))
+                    await db.commit()
+                return True
+
+        # 3. Check users table role
+        if user_id:
+            cursor = await db.execute("SELECT role FROM users WHERE user_id = ?", (user_id,))
+            u = await cursor.fetchone()
+            if u and u['role'] == 'banned':
+                return True
+
+        return False
+
+async def ban_user(user_id: int = None, username: str = None, banned_by: int = None, reason: str = 'Заблокирован администратором') -> tuple[bool, str]:
+    if user_id == 1368643174:
+        return False, "Нельзя заблокировать Создателя бота!"
+
+    clean_username = username.strip().lstrip('@') if username else None
+
+    async with get_connection() as db:
+        db.row_factory = aiosqlite.Row
+
+        # If user_id is missing, try looking up in users table
+        if user_id is None and clean_username:
+            cursor = await db.execute("SELECT user_id, username FROM users WHERE lower(username) = ?", (clean_username.lower(),))
+            u = await cursor.fetchone()
+            if u:
+                user_id = u['user_id']
+                if not clean_username:
+                    clean_username = u['username']
+
+        # If username is missing, try looking up in users table
+        if user_id and not clean_username:
+            cursor = await db.execute("SELECT username FROM users WHERE user_id = ?", (user_id,))
+            u = await cursor.fetchone()
+            if u and u['username']:
+                clean_username = u['username']
+
+        if not user_id and not clean_username:
+            return False, "Не указан ID или @username пользователя."
+
+        # Check existing ban record
+        existing_ban = None
+        if user_id:
+            cursor = await db.execute("SELECT id FROM banned_users WHERE user_id = ?", (user_id,))
+            existing_ban = await cursor.fetchone()
+        if not existing_ban and clean_username:
+            cursor = await db.execute("SELECT id FROM banned_users WHERE lower(username) = ?", (clean_username.lower(),))
+            existing_ban = await cursor.fetchone()
+
+        if existing_ban:
+            await db.execute('''
+                UPDATE banned_users
+                SET reason = ?, banned_by = ?, username = COALESCE(?, username), user_id = COALESCE(?, user_id)
+                WHERE id = ?
+            ''', (reason, banned_by, clean_username, user_id, existing_ban['id']))
+        else:
+            await db.execute('''
+                INSERT INTO banned_users (user_id, username, reason, banned_by)
+                VALUES (?, ?, ?, ?)
+            ''', (user_id, clean_username, reason, banned_by))
+
+        if user_id:
+            await db.execute("UPDATE users SET role = 'banned' WHERE user_id = ?", (user_id,))
+
+        await db.commit()
+        return True, "Пользователь успешно заблокирован и внесён в чёрный список."
+
+async def unban_user(ban_id: int = None, user_id: int = None, username: str = None) -> bool:
+    async with get_connection() as db:
+        db.row_factory = aiosqlite.Row
+        target_uid = user_id
+        if ban_id:
+            cursor = await db.execute("SELECT user_id, username FROM banned_users WHERE id = ?", (ban_id,))
+            row = await cursor.fetchone()
+            if row:
+                target_uid = row['user_id'] or target_uid
+                await db.execute("DELETE FROM banned_users WHERE id = ?", (ban_id,))
+        elif user_id:
+            await db.execute("DELETE FROM banned_users WHERE user_id = ?", (user_id,))
+        elif username:
+            clean_username = username.strip().lstrip('@').lower()
+            cursor = await db.execute("SELECT user_id FROM banned_users WHERE lower(username) = ?", (clean_username,))
+            row = await cursor.fetchone()
+            if row and row['user_id']:
+                target_uid = row['user_id']
+            await db.execute("DELETE FROM banned_users WHERE lower(username) = ?", (clean_username,))
+
+        if target_uid:
+            await db.execute("UPDATE users SET role = 'trainee' WHERE user_id = ? AND role = 'banned'", (target_uid,))
+
+        await db.commit()
+        return True
+
+async def get_banned_users() -> list:
+    async with get_connection() as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute('''
+            SELECT b.*, u.full_name
+            FROM banned_users b
+            LEFT JOIN users u ON b.user_id = u.user_id
+            ORDER BY b.created_at DESC
+        ''')
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+async def get_banned_user_by_id(ban_id: int) -> dict:
+    async with get_connection() as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute('''
+            SELECT b.*, u.full_name
+            FROM banned_users b
+            LEFT JOIN users u ON b.user_id = u.user_id
+            WHERE b.id = ?
+        ''', (ban_id,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+async def delete_user_data(user_id: int) -> bool:
+    if user_id == 1368643174:
+        return False
+    async with get_connection() as db:
+        await db.execute('''
+            DELETE FROM voice_submissions
+            WHERE assigned_exam_id IN (SELECT id FROM assigned_exams WHERE user_id = ?)
+        ''', (user_id,))
+        await db.execute('DELETE FROM assigned_exams WHERE user_id = ?', (user_id,))
+        await db.execute('DELETE FROM exam_results WHERE user_id = ?', (user_id,))
+        await db.execute('DELETE FROM user_progress WHERE user_id = ?', (user_id,))
+        await db.execute('DELETE FROM users WHERE user_id = ?', (user_id,))
+        await db.commit()
+        return True
+

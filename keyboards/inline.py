@@ -100,8 +100,26 @@ def get_admin_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🎯 Назначить экзамен стажёру", callback_data="admin:assign:start")],
         [InlineKeyboardButton(text="👥 Список сотрудников и прогресс", callback_data="admin:users")],
         [InlineKeyboardButton(text="👑 Управление админами (Роли)", callback_data="admin:roles:list")],
+        [InlineKeyboardButton(text="🚫 Чёрный список (Бан)", callback_data="admin:bans:menu")],
         [InlineKeyboardButton(text="📊 Аналитика ошибок (Топ)", callback_data="admin:analytics")],
         [InlineKeyboardButton(text="🏆 Протокол экзаменов", callback_data="admin:exams")],
         [InlineKeyboardButton(text="🔄 Перезагрузить меню из JSON", callback_data="admin:reload")],
         [InlineKeyboardButton(text="↩️ В главное меню", callback_data="main_menu")]
     ])
+
+def get_admin_bans_menu_kb(banned_count: int = 0) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"📋 Список заблокированных ({banned_count})", callback_data="admin:bans:list")],
+        [InlineKeyboardButton(text="➕ Заблокировать по ID / @username", callback_data="admin:bans:add")],
+        [InlineKeyboardButton(text="↩️ В админ-меню", callback_data="admin:menu")]
+    ])
+
+def get_banned_user_card_kb(ban_id: int, user_id: int = None) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(text="🟢 Разблокировать", callback_data=f"admin:bans:unban:{ban_id}")]
+    ]
+    if user_id and user_id != 1368643174:
+        buttons.append([InlineKeyboardButton(text="🗑 Удалить данные из БД", callback_data=f"admin:delete_user:{user_id}")])
+    buttons.append([InlineKeyboardButton(text="↩️ К чёрному списку", callback_data="admin:bans:list")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+

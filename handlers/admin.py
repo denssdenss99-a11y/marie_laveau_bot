@@ -1,17 +1,33 @@
 from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
 from database.db import (
     get_user,
     get_all_users,
     get_manager_analytics,
     get_connection,
-    import_initial_data
+    import_initial_data,
+    is_user_banned,
+    ban_user,
+    unban_user,
+    get_banned_users,
+    get_banned_user_by_id,
+    delete_user_data,
+    set_user_role
 )
-from keyboards.inline import get_admin_menu_kb
+from keyboards.inline import (
+    get_admin_menu_kb,
+    get_admin_bans_menu_kb,
+    get_banned_user_card_kb
+)
 from config import ADMIN_IDS
 
 router = Router()
+
+class AdminBanState(StatesGroup):
+    waiting_for_user_identifier = State()
 
 async def is_user_admin(user_id: int) -> bool:
     if user_id in ADMIN_IDS:
@@ -22,6 +38,8 @@ async def is_user_admin(user_id: int) -> bool:
 def get_user_role_display(u: dict) -> str:
     if u['user_id'] == 1368643174 or u.get('role') == 'spider_man':
         return "🕷 Человек-паук"
+    elif u.get('role') == 'banned' or u.get('is_banned'):
+        return "🚫 Заблокирован"
     elif u.get('role') in ('admin', 'manager'):
         return "👑 Администратор"
     return "🎓 Стажёр"
@@ -29,6 +47,8 @@ def get_user_role_display(u: dict) -> str:
 def get_user_role_icon(u: dict) -> str:
     if u['user_id'] == 1368643174 or u.get('role') == 'spider_man':
         return "🕷"
+    elif u.get('role') == 'banned' or u.get('is_banned'):
+        return "🚫"
     elif u.get('role') in ('admin', 'manager'):
         return "👑"
     return "🎓"
@@ -278,17 +298,31 @@ async def cb_admin_roles_user(call: CallbackQuery):
             [InlineKeyboardButton(text="↩️ К списку ролей", callback_data="admin:roles:list")]
         ]
     else:
-        role_title = "👑 Администратор / Менеджер" if user['role'] in ('admin', 'manager') else "🎓 Стажёр"
+        is_banned = user.get('role') == 'banned' or await is_user_banned(user_id=target_user_id)
+        if is_banned:
+            role_title = "🚫 Заблокирован (В чёрном списке)"
+        elif user['role'] in ('admin', 'manager'):
+            role_title = "👑 Администратор / Менеджер"
+        else:
+            role_title = "🎓 Стажёр"
+
         text = (
             f"👤 <b>Настройка доступа: {user['full_name']}</b> (@{user['username'] or '—'})\n"
-            f"Текущая роль: <b>{role_title}</b>\n\n"
-            f"Выберите новую роль для сотрудника:"
+            f"ID: <code>{user['user_id']}</code>\n"
+            f"Текущий статус: <b>{role_title}</b>\n\n"
+            f"Выберите действие для этого пользователя:"
         )
-        buttons = [
-            [InlineKeyboardButton(text="👑 Сделать Администратором", callback_data=f"admin:set_role:{target_user_id}:admin")],
-            [InlineKeyboardButton(text="🎓 Сделать Стажёром", callback_data=f"admin:set_role:{target_user_id}:trainee")],
-            [InlineKeyboardButton(text="↩️ К списку ролей", callback_data="admin:roles:list")]
-        ]
+        buttons = []
+        if is_banned:
+            buttons.append([InlineKeyboardButton(text="🟢 Разблокировать (Сделать стажёром)", callback_data=f"admin:unban_user:{target_user_id}")])
+        else:
+            buttons.append([InlineKeyboardButton(text="👑 Сделать Администратором", callback_data=f"admin:set_role:{target_user_id}:admin")])
+            buttons.append([InlineKeyboardButton(text="🎓 Сделать Стажёром", callback_data=f"admin:set_role:{target_user_id}:trainee")])
+            buttons.append([InlineKeyboardButton(text="🚫 Заблокировать (В Чёрный список)", callback_data=f"admin:ban_user:{target_user_id}")])
+
+        buttons.append([InlineKeyboardButton(text="🗑 Удалить из базы данных", callback_data=f"admin:delete_user:{target_user_id}")])
+        buttons.append([InlineKeyboardButton(text="↩️ К списку сотрудников", callback_data="admin:roles:list")])
+
     await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
     await call.answer()
 
@@ -334,7 +368,9 @@ async def cb_admin_set_role(call: CallbackQuery, bot: Bot):
             pass
 
 @router.callback_query(F.data == "admin:menu")
-async def cb_admin_menu_back(call: CallbackQuery):
+async def cb_admin_menu_back(call: CallbackQuery, state: FSMContext = None):
+    if state:
+        await state.clear()
     await call.message.edit_text(
         "⚙️ <b>ПАНЕЛЬ УПРАВЛЕНИЯ ОБУЧЕНИЕМ (МЕНЕДЖЕР)</b>\nВыберите действие:",
         reply_markup=get_admin_menu_kb(),
@@ -352,3 +388,285 @@ async def cb_admin_reload_data(call: CallbackQuery):
         await import_initial_data(db)
 
     await call.answer("✅ Меню успешно обновлено из JSON-файлов!", show_alert=True)
+
+# ==================== БЛОКИРОВКИ И ЧЁРНЫЙ СПИСОК ====================
+
+@router.callback_query(F.data.startswith("admin:ban_user:"))
+async def cb_admin_ban_user_direct(call: CallbackQuery):
+    if not await is_user_admin(call.from_user.id):
+        await call.answer("Доступ запрещён", show_alert=True)
+        return
+
+    target_user_id = int(call.data.split(":")[2])
+    if target_user_id == 1368643174:
+        await call.answer("🕷 Нельзя заблокировать Создателя!", show_alert=True)
+        return
+    if target_user_id == call.from_user.id:
+        await call.answer("⛔ Вы не можете заблокировать самого себя!", show_alert=True)
+        return
+
+    target_user = await get_user(target_user_id)
+    uname = target_user['username'] if target_user else None
+
+    await ban_user(
+        user_id=target_user_id,
+        username=uname,
+        banned_by=call.from_user.id,
+        reason="Заблокирован через карточку пользователя"
+    )
+    await call.answer("🚫 Пользователь внесён в чёрный список!", show_alert=True)
+    await cb_admin_roles_user(call)
+
+@router.callback_query(F.data.startswith("admin:unban_user:"))
+async def cb_admin_unban_user_direct(call: CallbackQuery):
+    if not await is_user_admin(call.from_user.id):
+        await call.answer("Доступ запрещён", show_alert=True)
+        return
+
+    target_user_id = int(call.data.split(":")[2])
+    await unban_user(user_id=target_user_id)
+    await call.answer("🟢 Пользователь успешно разблокирован!", show_alert=True)
+    await cb_admin_roles_user(call)
+
+@router.callback_query(F.data.startswith("admin:delete_user:"))
+async def cb_admin_delete_user_ask(call: CallbackQuery):
+    if not await is_user_admin(call.from_user.id):
+        await call.answer("Доступ запрещён", show_alert=True)
+        return
+
+    target_user_id = int(call.data.split(":")[2])
+    if target_user_id == 1368643174:
+        await call.answer("🕷 Нельзя удалить Создателя!", show_alert=True)
+        return
+
+    user = await get_user(target_user_id)
+    name = user['full_name'] if user else f"ID {target_user_id}"
+
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    text = (
+        f"⚠️ <b>ВНИМАНИЕ! ПОДТВЕРЖДЕНИЕ УДАЛЕНИЯ</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Вы действительно хотите полностью удалить пользователя <b>{name}</b>?\n\n"
+        f"Будут безвозвратно стёрты:\n"
+        f"• Профиль сотрудника\n"
+        f"• Прогресс тренажёра и флеш-карточек\n"
+        f"• История всех сданных экзаменов и голосовых ответов\n\n"
+        f"<i>Это действие необратимо!</i>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Да, удалить навсегда", callback_data=f"admin:delete_confirm:{target_user_id}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin:roles:user:{target_user_id}")]
+    ])
+    await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await call.answer()
+
+@router.callback_query(F.data.startswith("admin:delete_confirm:"))
+async def cb_admin_delete_user_confirm(call: CallbackQuery):
+    if not await is_user_admin(call.from_user.id):
+        await call.answer("Доступ запрещён", show_alert=True)
+        return
+
+    target_user_id = int(call.data.split(":")[2])
+    if target_user_id == 1368643174:
+        await call.answer("🕷 Нельзя удалить Создателя!", show_alert=True)
+        return
+
+    await delete_user_data(target_user_id)
+    await call.answer("🗑 Пользователь успешно удалён из базы данных!", show_alert=True)
+    await cb_admin_roles_list(call)
+
+@router.callback_query(F.data == "admin:bans:menu")
+async def cb_admin_bans_menu(call: CallbackQuery, state: FSMContext = None):
+    if not await is_user_admin(call.from_user.id):
+        await call.answer("Доступ запрещён", show_alert=True)
+        return
+
+    if state:
+        await state.clear()
+
+    banned_list = await get_banned_users()
+    count = len(banned_list)
+
+    text = (
+        "🚫 <b>УПРАВЛЕНИЕ ЧЁРНЫМ СПИСКОМ (БАН)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"Текущее количество заблокированных: <b>{count}</b>\n\n"
+        "Заблокированные пользователи не имеют доступа к тренажёру, экзаменам, "
+        "базе знаний и шпаргалкам бара.\n\n"
+        "Вы можете заблокировать постороннего человека по его <b>Telegram ID</b> или <b>@username</b>, "
+        "либо выбрать сотрудника из списка пользователей."
+    )
+    await call.message.edit_text(text, reply_markup=get_admin_bans_menu_kb(count), parse_mode="HTML")
+    await call.answer()
+
+@router.callback_query(F.data == "admin:bans:list")
+async def cb_admin_bans_list(call: CallbackQuery):
+    if not await is_user_admin(call.from_user.id):
+        await call.answer("Доступ запрещён", show_alert=True)
+        return
+
+    banned_list = await get_banned_users()
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+    if not banned_list:
+        text = (
+            "📋 <b>ЧЁРНЫЙ СПИСОК ПУСТ</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "В данный момент нет ни одного заблокированного пользователя."
+        )
+        buttons = [
+            [InlineKeyboardButton(text="➕ Заблокировать по ID / @username", callback_data="admin:bans:add")],
+            [InlineKeyboardButton(text="↩️ В меню блокировок", callback_data="admin:bans:menu")]
+        ]
+        await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+        await call.answer()
+        return
+
+    text = (
+        "📋 <b>СПИСОК ЗАБЛОКИРОВАННЫХ ПОЛЬЗОВАТЕЛЕЙ</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Нажмите на пользователя для просмотра деталей или разблокировки:\n\n"
+    )
+    buttons = []
+    for b in banned_list[:25]:
+        uname = f"@{b['username']}" if b['username'] else "нет username"
+        uid_str = f"ID: {b['user_id']}" if b['user_id'] else "ID: —"
+        name_str = f" ({b['full_name']})" if b.get('full_name') else ""
+        button_label = f"🚫 {uname} [{uid_str}]{name_str}"
+        buttons.append([InlineKeyboardButton(
+            text=button_label[:42],
+            callback_data=f"admin:bans:view:{b['id']}"
+        )])
+
+    buttons.append([InlineKeyboardButton(text="➕ Заблокировать ещё", callback_data="admin:bans:add")])
+    buttons.append([InlineKeyboardButton(text="↩️ В меню блокировок", callback_data="admin:bans:menu")])
+
+    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+    await call.answer()
+
+@router.callback_query(F.data.startswith("admin:bans:view:"))
+async def cb_admin_bans_view(call: CallbackQuery):
+    if not await is_user_admin(call.from_user.id):
+        await call.answer("Доступ запрещён", show_alert=True)
+        return
+
+    ban_id = int(call.data.split(":")[3])
+    b = await get_banned_user_by_id(ban_id)
+    if not b:
+        await call.answer("Запись не найдена", show_alert=True)
+        return
+
+    uname = f"@{b['username']}" if b['username'] else "—"
+    uid_str = str(b['user_id']) if b['user_id'] else "—"
+    name_str = b['full_name'] if b.get('full_name') else "—"
+    date_str = str(b.get('created_at', ''))[:16]
+
+    text = (
+        f"🚫 <b>КАРТОЧКА БЛОКИРОВКИ #{b['id']}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"• Telegram ID: <code>{uid_str}</code>\n"
+        f"• Username: <b>{uname}</b>\n"
+        f"• Имя в базе: <b>{name_str}</b>\n"
+        f"• Причина: <i>{b.get('reason') or 'Не указана'}</i>\n"
+        f"• Дата бана: <b>{date_str}</b>\n"
+    )
+
+    await call.message.edit_text(text, reply_markup=get_banned_user_card_kb(ban_id, b.get('user_id')), parse_mode="HTML")
+    await call.answer()
+
+@router.callback_query(F.data.startswith("admin:bans:unban:"))
+async def cb_admin_bans_unban(call: CallbackQuery):
+    if not await is_user_admin(call.from_user.id):
+        await call.answer("Доступ запрещён", show_alert=True)
+        return
+
+    ban_id = int(call.data.split(":")[3])
+    await unban_user(ban_id=ban_id)
+    await call.answer("🟢 Пользователь успешно разблокирован!", show_alert=True)
+    await cb_admin_bans_list(call)
+
+@router.callback_query(F.data == "admin:bans:add")
+async def cb_admin_bans_add(call: CallbackQuery, state: FSMContext):
+    if not await is_user_admin(call.from_user.id):
+        await call.answer("Доступ запрещён", show_alert=True)
+        return
+
+    await state.set_state(AdminBanState.waiting_for_user_identifier)
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    text = (
+        "🚫 <b>БЛОКИРОВКА ПОЛЬЗОВАТЕЛЯ</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Отправьте сообщением <b>Telegram ID</b> (цифры) или <b>@username</b> человека, "
+        "которого хотите заблокировать.\n\n"
+        "<i>Примеры:</i>\n"
+        "• <code>123456789</code>\n"
+        "• <code>@username_user</code>\n\n"
+        "После этого бот мгновенно ограничит доступ данному человеку ко всем функциям."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin:bans:menu")]
+    ])
+    await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await call.answer()
+
+@router.message(AdminBanState.waiting_for_user_identifier)
+async def msg_admin_ban_input(message: Message, state: FSMContext):
+    if not await is_user_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    raw_text = (message.text or '').strip()
+    if raw_text.lower() in ('/cancel', 'отмена', 'назад'):
+        await state.clear()
+        banned_list = await get_banned_users()
+        await message.answer("❌ Блокировка отменена.", reply_markup=get_admin_bans_menu_kb(len(banned_list)))
+        return
+
+    user_id = None
+    username = None
+
+    if raw_text.startswith('@'):
+        username = raw_text.lstrip('@')
+    elif raw_text.isdigit():
+        user_id = int(raw_text)
+    else:
+        username = raw_text
+
+    if user_id == 1368643174:
+        await message.answer("🕷 <b>Нельзя заблокировать Человека-паука (Создателя)!</b>", parse_mode="HTML")
+        await state.clear()
+        return
+
+    if user_id == message.from_user.id:
+        await message.answer("⛔ <b>Вы не можете заблокировать самого себя!</b>", parse_mode="HTML")
+        await state.clear()
+        return
+
+    ok, res_msg = await ban_user(
+        user_id=user_id,
+        username=username,
+        banned_by=message.from_user.id,
+        reason="Заблокирован администратором вручную"
+    )
+
+    await state.clear()
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Список заблокированных", callback_data="admin:bans:list")],
+        [InlineKeyboardButton(text="➕ Заблокировать ещё", callback_data="admin:bans:add")],
+        [InlineKeyboardButton(text="↩️ В админ-меню", callback_data="admin:menu")]
+    ])
+
+    if ok:
+        target_display = f"ID: <code>{user_id}</code>" if user_id else f"@{username}"
+        await message.answer(
+            f"✅ <b>Пользователь успешно заблокирован!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Идентификатор: {target_display}\n"
+            f"Пользователь внесён в чёрный список и больше не имеет доступа к боту.",
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+    else:
+        await message.answer(f"⚠️ Ошибка при блокировке: {res_msg}", reply_markup=kb)
+

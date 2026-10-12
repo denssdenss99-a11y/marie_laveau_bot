@@ -7,6 +7,7 @@ from aiogram.client.default import DefaultBotProperties
 
 from config import BOT_TOKEN
 from database.db import init_db
+from middlewares import BanMiddleware
 from handlers import (
     common,
     trainer,
@@ -44,6 +45,11 @@ async def main():
         default=DefaultBotProperties(parse_mode=ParseMode.HTML)
     )
     dp = Dispatcher()
+
+    # Register BanMiddleware to block banned users across all handlers
+    ban_middleware = BanMiddleware()
+    dp.message.outer_middleware(ban_middleware)
+    dp.callback_query.outer_middleware(ban_middleware)
 
     # Register routers in priority order
     dp.include_router(common.router)
